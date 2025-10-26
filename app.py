@@ -1,37 +1,67 @@
-import streamlit as st
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from ultralytics import YOLO
 import cv2
-import requests
+import time
 import numpy as np
 
-st.title("YOLOv11 Real-Time Object Detection")
+# --- Initialize FastAPI and YOLO model ---
+app = FastAPI(title="YOLO Real-Time Detection")
+model = YOLO("models/v10_m_yolo11.pt")  # your trained model file
 
-BACKEND_URL = "http://127.0.0.1:8000/predict"
+# --- Helper: Draw FPS and Confidence ---
+def draw_info(frame, fps, conf):
+    text_fps = f"FPS: {fps:.2f}"
+    text_conf = f"Avg Conf: {conf:.2f}"
+    cv2.putText(frame, text_fps, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(frame, text_conf, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    return frame
 
-# initialize webcam
-run = st.checkbox("Start camera")
-FRAME_WINDOW = st.image([])
+# --- Generator for webcam frames ---
+def generate_frames():
+    cap = cv2.VideoCapture(0)
+    prev_time = time.time()
 
-cap = cv2.VideoCapture(0)  # default camera
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
 
-while run:
-    ret, frame = cap.read()
-    if not ret:
-        st.warning("No frame captured from camera")
-        break
+        # --- Measure FPS ---
+        current_time = time.time()
+        fps = 1 / (current_time - prev_time)
+        prev_time = current_time
 
-    # encode frame as JPEG for sending
-    _, buffer = cv2.imencode('.jpg', frame)
-    response = requests.post(
-        BACKEND_URL,
-        files={"file": ("frame.jpg", buffer.tobytes(), "image/jpeg")}
+        # --- YOLO inference ---
+        results = model(frame)
+        annotated_frame = results[0].plot()
+
+        # --- Calculate average confidence ---
+        confs = results[0].boxes.conf.cpu().numpy() if results[0].boxes is not None else []
+        avg_conf = np.mean(confs) if len(confs) > 0 else 0.0
+
+        # --- Draw FPS and confidence on frame ---
+        annotated_frame = draw_info(annotated_frame, fps, avg_conf)
+
+        # --- Encode and stream ---
+        _, buffer = cv2.imencode(".jpg", annotated_frame)
+        frame_bytes = buffer.tobytes()
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+        )
+
+    cap.release()
+
+# --- API route for video feed ---
+@app.get("/video_feed")
+def video_feed():
+    return StreamingResponse(
+        generate_frames(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
-    if response.status_code == 200:
-        img_bytes = response.json()["image_bytes"]
-        nparr = np.frombuffer(bytes(img_bytes, "latin1"), np.uint8)
-        annotated = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        FRAME_WINDOW.image(annotated, channels="BGR")
-    else:
-        FRAME_WINDOW.image(frame, channels="BGR")
-
-cap.release()
+# --- Root endpoint ---
+@app.get("/")
+def root():
+    return {"message": "YOLO real-time detection. Visit /video_feed to see the camera stream."}
